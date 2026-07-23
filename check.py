@@ -1,177 +1,124 @@
-"""Wi-Fi visibility and saved-profile audit helper for Windows.
-
-This script lists Wi-Fi networks currently visible to your adapter and can show
-security details for profiles already saved on this computer. Windows does not
-expose passwords for arbitrary nearby networks; displaying keys only works for
-profiles that were previously saved by the current Windows installation and
-that the current user is authorized to view.
-"""
-
-
-import re
-import subprocess
-import sys
+import pywifi
+from pywifi import const
+import time
 from dataclasses import dataclass
 
+@dataclass
+class AccessPointNode:
+    bssid: str
+    signal_rssi: int
+    cipher_type: str
 
 @dataclass
-class VisibleNetwork:
+class DiscoveredNetwork:
     ssid: str
-    auth: str = "Unknown"
-    encryption: str = "Unknown"
-    signal: str = "Unknown"
+    auth_protocol: str
+    access_points: list[AccessPointNode]
 
+def parse_auth_type(auth_id_list) -> str:
+    """Map native hardware status codes to clean text protocols."""
+    # pywifi usually passes a list of auth IDs
+    auth_id = auth_id_list[0] if isinstance(auth_id_list, list) and auth_id_list else auth_id_list
+    mapping = {
+        const.AUTH_ALG_OPEN: "Open / Unsecured",
+        const.AUTH_ALG_SHARED: "Shared Key",
+        const.AKM_TYPE_WPA: "WPA-Enterprise",
+        const.AKM_TYPE_WPAPSK: "WPA-Personal",
+        const.AKM_TYPE_WPA2: "WPA2-Enterprise",
+        const.AKM_TYPE_WPA2PSK: "WPA2-Personal",
+        7: "WPA3-Personal" 
+    }
+    return mapping.get(auth_id, f"Unknown Protocol ({auth_id})")
 
-def run_netsh(command: list[str]) -> str:
-    """Run a netsh command and return decoded output."""
-    try:
-        return subprocess.check_output(
-            command,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError:
-        sys.exit("This script must be run on Windows where netsh is available.")
-    except subprocess.CalledProcessError as exc:
-        sys.exit(f"Command failed: {' '.join(command)}\n\n{exc.output}")
+def parse_cipher_type(cipher_id) -> str:
+    """Map structural data codes to clear text encryptions."""
+    mapping = {
+        const.CIPHER_TYPE_NONE: "None",
+        const.CIPHER_TYPE_WEP: "WEP",
+        const.CIPHER_TYPE_TKIP: "TKIP",
+        const.CIPHER_TYPE_CCMP: "CCMP (AES)"
+    }
+    return mapping.get(cipher_id, f"Unknown/Other Cipher ({cipher_id})")
 
+def force_airwave_scan() -> list[DiscoveredNetwork]:
+    """Intersects native kernel wireless routines to pull down everything in the air."""
+    wifi = pywifi.PyWiFi()
+    
+    if not wifi.interfaces():
+        print("[-] Error: No physical Wi-Fi adapter cards detected on this computer.")
+        return []
+        
+    interface = wifi.interfaces()[0] # Pull the primary network interface card
+    
+    print(f"[*] Hardware Card Detected: {interface.name()}")
+    print("[*] Broadcasting active airwave probes... forcing radio infrastructure update.")
+    
+    interface.scan()
+    time.sleep(3.5)  # Safe buffer window to let neighboring radio responses return
+    
+    raw_results = interface.scan_results()
+    network_registry = {}
+    
+    for ap in raw_results:
+        ssid = ap.ssid
+        if isinstance(ssid, bytes):
+            ssid = ssid.decode('utf-8', errors='replace')
+        ssid = ssid.strip() or "<Hidden Network / Blind Beacon>"
+        
+        mac = str(ap.bssid).upper().replace("-", ":")
+        if len(mac) > 17: 
+            mac = mac[:17]
+            
+        auth_string = "Open"
+        if ap.akm:
+            auth_string = parse_auth_type(ap.akm)
+            
+        cipher_string = parse_cipher_type(ap.cipher)
+        
+        net_key = (ssid, auth_string)
+        if net_key not in network_registry:
+            network_registry[net_key] = DiscoveredNetwork(
+                ssid=ssid,
+                auth_protocol=auth_string,
+                access_points=[]
+            )
+            
+        existing_bssids = {node.bssid for node in network_registry[net_key].access_points}
+        if mac not in existing_bssids:
+            network_registry[net_key].access_points.append(
+                AccessPointNode(bssid=mac, signal_rssi=ap.signal, cipher_type=cipher_string)
+            )
+            
+    return list(network_registry.values())
 
-def get_visible_networks() -> list[VisibleNetwork]:
-    """Return nearby Wi-Fi networks visible to the adapter."""
-    output = run_netsh(["netsh", "wlan", "show", "networks", "mode=bssid"])
-    networks: list[VisibleNetwork] = []
-    current: VisibleNetwork | None = None
-
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        ssid_match = re.match(r"SSID\s+\d+\s*:\s*(.*)", line)
-        if ssid_match:
-            current = VisibleNetwork(ssid=ssid_match.group(1).strip() or "<hidden>")
-            networks.append(current)
-            continue
-
-        if current is None or ":" not in line:
-            continue
-
-        key, value = [part.strip() for part in line.split(":", 1)]
-        if key == "Authentication":
-            current.auth = value
-        elif key == "Encryption":
-            current.encryption = value
-        elif key == "Signal" and current.signal == "Unknown":
-            current.signal = value
-
-    return networks
-
-
-def get_saved_profile_names() -> list[str]:
-    """Return Wi-Fi profile names saved on this computer."""
-    output = run_netsh(["netsh", "wlan", "show", "profiles"])
-    names: list[str] = []
-    for line in output.splitlines():
-        if "All User Profile" in line and ":" in line:
-            names.append(line.split(":", 1)[1].strip())
-    return names
-
-
-def get_saved_profile_details(profile_name: str) -> str:
-    """Return details for a saved Wi-Fi profile, including its key if Windows allows it."""
-    return run_netsh(
-        ["netsh", "wlan", "show", "profile", f"name={profile_name}", "key=clear"]
-    )
-
-
-def extract_saved_profile_password(profile_details: str) -> str | None:
-    """Extract the saved Wi-Fi key from netsh profile details when present."""
-    for line in profile_details.splitlines():
-        if "Key Content" in line and ":" in line:
-            return line.split(":", 1)[1].strip()
-    return None
-
-
-def choose(options: list[str], prompt: str) -> str | None:
-    """Prompt for a numbered option and return the selected value."""
-    if not options:
-        return None
-
-    while True:
-        choice = input(prompt).strip()
-        if choice.lower() in {"q", "quit", "exit"}:
-            return None
-        if choice.isdigit() and 1 <= int(choice) <= len(options):
-            return options[int(choice) - 1]
-        print(f"Enter a number from 1 to {len(options)}, or q to quit.")
-
-
-def main() -> None:
-    visible = get_visible_networks()
-    saved_profiles = get_saved_profile_names()
-    saved_lookup = {name.casefold(): name for name in saved_profiles}
-
-    print("Nearby Wi-Fi networks:")
-    if not visible:
-        print("  No networks found.")
-    for index, network in enumerate(visible, 1):
-        saved_marker = (
-            "saved profile"
-            if network.ssid.casefold() in saved_lookup
-            else "not saved"
-        )
-        print(
-            f"[{index}] {network.ssid} | {network.auth} | "
-            f"{network.encryption} | Signal: {network.signal} | {saved_marker}"
-        )
-
-    print(
-        "\nNote: You cannot reveal passwords for arbitrary scannable networks. "
-        "Windows can only show keys for profiles already saved on this computer "
-        "when your account has permission."
-    )
-
-    matching_saved = [
-        saved_lookup[network.ssid.casefold()]
-        for network in visible
-        if network.ssid.casefold() in saved_lookup
-    ]
-    matching_saved_set = set(matching_saved)
-    remaining_saved = [
-        name for name in saved_profiles if name not in matching_saved_set
-    ]
-    display_profiles = matching_saved + remaining_saved
-
-    if not display_profiles:
-        print("\nNo saved Wi-Fi profiles were found on this computer.")
+def main():
+    print("Executing native airwave scan for structural wireless topologies...\n")
+    all_networks = force_airwave_scan()
+    
+    if not all_networks:
+        print("[-] No network hardware infrastructure detected in scannable range.")
         return
-
-    print("\nSaved profiles available for authorized audit:")
-    for index, profile in enumerate(display_profiles, 1):
-        in_range = (
-            "in range" if profile in matching_saved else "not currently visible"
-        )
-        print(f"[{index}] {profile} ({in_range})")
-
-    selected = choose(
-        display_profiles, "\nChoose a saved profile to inspect, or q to quit: "
-    )
-    if selected is None:
-        return
-
-    details = get_saved_profile_details(selected)
-    password = extract_saved_profile_password(details)
-
-    print(f"\nSaved profile: {selected}")
-    if password:
-        print(f"Saved Wi-Fi password: {password}")
-    else:
-        print(
-            "Saved Wi-Fi password: <not available; this profile may be open, "
-            "managed by policy, or restricted by Windows permissions>"
-        )
-
-    print("\nFull profile details:\n" + details)
-
+        
+    print(f"\n[+] Discovered {len(all_networks)} discrete wireless infrastructures near you:\n")
+    for idx, net in enumerate(all_networks, 1):
+        print(f"[{idx}] Logical Identifier (SSID): {net.ssid}")
+        print(f"    ├─ Security Protocol:  {net.auth_protocol}")
+        print(f"    └─ Active Base Transceiver Stations (Access Points): {len(net.access_points)}")
+        
+        sorted_nodes = sorted(net.access_points, key=lambda x: x.signal_rssi, reverse=True)
+        
+        for ap_idx, node in enumerate(sorted_nodes, 1):
+            is_last = ap_idx == len(sorted_nodes)
+            branch = "        └─" if is_last else "        ├─"
+            sub_branch = "           " if is_last else "        │  "
+            
+            # Map RSSI values securely to generic percentage levels
+            quality_percentage = min(max(2 * (node.signal_rssi + 100), 0), 100)
+            
+            print(f"{branch} Physical Hardware Node #{ap_idx} [MAC: {node.bssid}]")
+            print(f"{sub_branch}├─ Signal Quality: {quality_percentage}% (RSSI: {node.signal_rssi} dBm)")
+            print(f"{sub_branch}└─ Encryption Cipher: {node.cipher_type}")
+        print("=" * 65)
 
 if __name__ == "__main__":
     main()
