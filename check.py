@@ -1,14 +1,177 @@
+"""Wi-Fi visibility and saved-profile audit helper for Windows.
+
+This script lists Wi-Fi networks currently visible to your adapter and can show
+security details for profiles already saved on this computer. Windows does not
+expose passwords for arbitrary nearby networks; displaying keys only works for
+profiles that were previously saved by the current Windows installation and
+that the current user is authorized to view.
+"""
+
+
+import re
 import subprocess
+import sys
+from dataclasses import dataclass
 
-profiles = subprocess.check_output("netsh wlan show profiles", shell=True).decode()
 
-names = [line.split(":")[1].strip() for line in profiles.split("\n") if "All User Profile" in line]
+@dataclass
+class VisibleNetwork:
+    ssid: str
+    auth: str = "Unknown"
+    encryption: str = "Unknown"
+    signal: str = "Unknown"
 
-for i, n in enumerate(names, 1):
-    print(f"[{i}] {n}")
 
-ch = int(input("\nChoose WiFi number: "))
-wifi_name = names[ch - 1]
-result = subprocess.check_output(
-    f"netsh wlan show profile {wifi_name} key=clear", shell=True).decode()
-print("\n" + result)
+def run_netsh(command: list[str]) -> str:
+    """Run a netsh command and return decoded output."""
+    try:
+        return subprocess.check_output(
+            command,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        sys.exit("This script must be run on Windows where netsh is available.")
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"Command failed: {' '.join(command)}\n\n{exc.output}")
+
+
+def get_visible_networks() -> list[VisibleNetwork]:
+    """Return nearby Wi-Fi networks visible to the adapter."""
+    output = run_netsh(["netsh", "wlan", "show", "networks", "mode=bssid"])
+    networks: list[VisibleNetwork] = []
+    current: VisibleNetwork | None = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        ssid_match = re.match(r"SSID\s+\d+\s*:\s*(.*)", line)
+        if ssid_match:
+            current = VisibleNetwork(ssid=ssid_match.group(1).strip() or "<hidden>")
+            networks.append(current)
+            continue
+
+        if current is None or ":" not in line:
+            continue
+
+        key, value = [part.strip() for part in line.split(":", 1)]
+        if key == "Authentication":
+            current.auth = value
+        elif key == "Encryption":
+            current.encryption = value
+        elif key == "Signal" and current.signal == "Unknown":
+            current.signal = value
+
+    return networks
+
+
+def get_saved_profile_names() -> list[str]:
+    """Return Wi-Fi profile names saved on this computer."""
+    output = run_netsh(["netsh", "wlan", "show", "profiles"])
+    names: list[str] = []
+    for line in output.splitlines():
+        if "All User Profile" in line and ":" in line:
+            names.append(line.split(":", 1)[1].strip())
+    return names
+
+
+def get_saved_profile_details(profile_name: str) -> str:
+    """Return details for a saved Wi-Fi profile, including its key if Windows allows it."""
+    return run_netsh(
+        ["netsh", "wlan", "show", "profile", f"name={profile_name}", "key=clear"]
+    )
+
+
+def extract_saved_profile_password(profile_details: str) -> str | None:
+    """Extract the saved Wi-Fi key from netsh profile details when present."""
+    for line in profile_details.splitlines():
+        if "Key Content" in line and ":" in line:
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def choose(options: list[str], prompt: str) -> str | None:
+    """Prompt for a numbered option and return the selected value."""
+    if not options:
+        return None
+
+    while True:
+        choice = input(prompt).strip()
+        if choice.lower() in {"q", "quit", "exit"}:
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(options):
+            return options[int(choice) - 1]
+        print(f"Enter a number from 1 to {len(options)}, or q to quit.")
+
+
+def main() -> None:
+    visible = get_visible_networks()
+    saved_profiles = get_saved_profile_names()
+    saved_lookup = {name.casefold(): name for name in saved_profiles}
+
+    print("Nearby Wi-Fi networks:")
+    if not visible:
+        print("  No networks found.")
+    for index, network in enumerate(visible, 1):
+        saved_marker = (
+            "saved profile"
+            if network.ssid.casefold() in saved_lookup
+            else "not saved"
+        )
+        print(
+            f"[{index}] {network.ssid} | {network.auth} | "
+            f"{network.encryption} | Signal: {network.signal} | {saved_marker}"
+        )
+
+    print(
+        "\nNote: You cannot reveal passwords for arbitrary scannable networks. "
+        "Windows can only show keys for profiles already saved on this computer "
+        "when your account has permission."
+    )
+
+    matching_saved = [
+        saved_lookup[network.ssid.casefold()]
+        for network in visible
+        if network.ssid.casefold() in saved_lookup
+    ]
+    matching_saved_set = set(matching_saved)
+    remaining_saved = [
+        name for name in saved_profiles if name not in matching_saved_set
+    ]
+    display_profiles = matching_saved + remaining_saved
+
+    if not display_profiles:
+        print("\nNo saved Wi-Fi profiles were found on this computer.")
+        return
+
+    print("\nSaved profiles available for authorized audit:")
+    for index, profile in enumerate(display_profiles, 1):
+        in_range = (
+            "in range" if profile in matching_saved else "not currently visible"
+        )
+        print(f"[{index}] {profile} ({in_range})")
+
+    selected = choose(
+        display_profiles, "\nChoose a saved profile to inspect, or q to quit: "
+    )
+    if selected is None:
+        return
+
+    details = get_saved_profile_details(selected)
+    password = extract_saved_profile_password(details)
+
+    print(f"\nSaved profile: {selected}")
+    if password:
+        print(f"Saved Wi-Fi password: {password}")
+    else:
+        print(
+            "Saved Wi-Fi password: <not available; this profile may be open, "
+            "managed by policy, or restricted by Windows permissions>"
+        )
+
+    print("\nFull profile details:\n" + details)
+
+
+if __name__ == "__main__":
+    main()
